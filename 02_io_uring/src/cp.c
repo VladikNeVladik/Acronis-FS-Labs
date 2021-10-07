@@ -1,26 +1,27 @@
 // No copyright. 2021, Vladislav Aleinik
-
-#define _DEFAULT_SOURCE 1
-#define _GNU_SOURCE 1
+#define _ISOC11_SOURCE
+#define _GNU_SOURCE
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
 
-#include "Logging.h"
-#include "IO_Ring.h"
+#include <logging.h>
+
+#include <liburing.h>
 
 //===========================
 // Copy procedure parameters 
 //===========================
 
-const unsigned READ_BLOCK_SIZE  = 4096U;
 const unsigned NUM_RING_ENTRIES =    8U;
+const unsigned READ_BLOCK_SIZE  = 4096U;
 
 //================
 // Copying status
@@ -36,7 +37,7 @@ struct BlockStatus
 {
     BlockStage stage;
 
-    off_t offset;
+    off64_t offset;
     uint32_t size;
 };
 
@@ -51,9 +52,12 @@ struct CopyStatus
     uint16_t num_block_in_progress;
 
     struct BlockStatus* block_statuses;
+
+    char* aligned_buffers;
+    struct iovec* fixed_buffers;
 };
 
-void init_copying_status(struct CopyStatus* status, uint32_t src_size, int src_fd, int dst_fd)
+void init_copying_status(struct io_uring* io_ring, struct CopyStatus* status, uint32_t src_size, int src_fd, int dst_fd)
 {
     status->src_fd   = src_fd;
     status->dst_fd   = dst_fd;
@@ -63,11 +67,7 @@ void init_copying_status(struct CopyStatus* status, uint32_t src_size, int src_f
     status->num_block_in_progress = 0;
 
     status->block_statuses = malloc(NUM_RING_ENTRIES * sizeof(struct BlockStatus));
-    if (status->block_statuses == NULL)
-    {
-        LOG_ERROR("Unable to allocate memory for block statuses");
-        exit(EXIT_FAILURE);
-    }
+    // (Assume malloc can't fail)
 
     for (uint16_t i = 0; i < NUM_RING_ENTRIES; ++i)
     {
@@ -75,9 +75,38 @@ void init_copying_status(struct CopyStatus* status, uint32_t src_size, int src_f
         status->block_statuses[i].offset = 0;
         status->block_statuses[i].size   = 0;
     }
+
+    // Create buffers to store intermediate data:
+    // (Assume aligned_alloc does not fail)
+    status->aligned_buffers = (char*) aligned_alloc(READ_BLOCK_SIZE, NUM_RING_ENTRIES * READ_BLOCK_SIZE);
+
+    status->fixed_buffers = malloc(NUM_RING_ENTRIES * sizeof(struct iovec));
+    // (Assume aligned_alloc does not fail)    
+
+    for (unsigned i = 0; i < NUM_RING_ENTRIES; ++i)
+    {
+        status->fixed_buffers[i].iov_base = status->aligned_buffers + i * READ_BLOCK_SIZE;
+        status->fixed_buffers[i].iov_len  = READ_BLOCK_SIZE;
+    }
+
+    if (io_uring_register_buffers(io_ring, status->fixed_buffers, NUM_RING_ENTRIES) != 0)
+    {
+        LOG_ERROR("Unable to register intermediate buffers");
+    }
 }
 
-void prepare_read_request(struct IO_Ring* io_ring, struct CopyStatus* status, unsigned cell)
+void free_copying_status(struct CopyStatus* status)
+{
+    free(status->block_statuses);
+    free(status->aligned_buffers);
+    free(status->fixed_buffers);
+}
+
+//=====================
+// Io-ring interaction 
+//=====================
+
+void prepare_read_request(struct io_uring* io_ring, struct CopyStatus* status, unsigned cell)
 {
     struct BlockStatus* block = &status->block_statuses[cell];
 
@@ -89,19 +118,41 @@ void prepare_read_request(struct IO_Ring* io_ring, struct CopyStatus* status, un
     block->offset = status->src_off;
     block->size   = (bytes_left < READ_BLOCK_SIZE)? bytes_left : READ_BLOCK_SIZE;
 
-    enqueue_io_request(io_ring, IORING_OP_READ_FIXED, status->src_fd, cell, block->offset, block->size);
+    // Enqueue read request: 
+    struct io_uring_sqe* read_sqe = io_uring_get_sqe(io_ring);
+
+    BUG_ON(read_sqe == NULL, "Expected non-full IO-ring!");
+
+    io_uring_prep_read_fixed(read_sqe, status->src_fd,
+                             status->fixed_buffers[cell].iov_base,
+                             block->size, block->offset, cell);
+
+    read_sqe->user_data = cell;
 
     status->src_off += block->size;
     status->num_block_in_progress += 1;
+
+    LOG("Cell#%02d:  read (off=%lu, size=%u)", cell, block->offset, block->size);
 }
 
-void prepare_write_request(struct IO_Ring* io_ring, struct CopyStatus* status, unsigned cell)
+void prepare_write_request(struct io_uring* io_ring, struct CopyStatus* status, unsigned cell)
 {
     struct BlockStatus* block = &status->block_statuses[cell];
 
     block->stage = BLOCK_IN_WRITE;
-    
-    enqueue_io_request(io_ring, IORING_OP_WRITE_FIXED, status->dst_fd, cell, block->offset, block->size);
+
+    // Enqueue write request:
+    struct io_uring_sqe* write_sqe = io_uring_get_sqe(io_ring);
+
+    BUG_ON(write_sqe == NULL, "Expected non-full IO-ring!");
+
+    io_uring_prep_write_fixed(write_sqe, status->dst_fd,
+                              status->aligned_buffers + cell * READ_BLOCK_SIZE,
+                              block->size, block->offset, cell);
+
+    write_sqe->user_data = cell;
+
+    LOG("Cell#%02d: write (off=%lu, size=%u)", cell, block->offset, block->size);
 }
 
 void finish_write_request(struct CopyStatus* status, unsigned cell)
@@ -179,34 +230,15 @@ int main(int argc, char* argv[])
     LOG("Start initializing IO-ring");
 
     // Initialize IO-userspace-ring:
-    struct IO_Ring io_ring;
-    init_io_ring(&io_ring, NUM_RING_ENTRIES);
-
-    // Create buffers to store intermediate data:
-    char* aligned_buffers = (char*) aligned_alloc(READ_BLOCK_SIZE, NUM_RING_ENTRIES * READ_BLOCK_SIZE);
-    if (aligned_buffers == NULL)
+    struct io_uring io_ring;
+    if (io_uring_queue_init(NUM_RING_ENTRIES, &io_ring, 0) != 0)
     {
-        LOG_ERROR("Unable to allocate aligned memory");
+        LOG_ERROR("Unable to initialize IO-ring");
     }
-
-    struct iovec* fixed_buffers = (struct iovec*) malloc(NUM_RING_ENTRIES * sizeof(struct iovec));
-    if (fixed_buffers == NULL)
-    {
-        LOG_ERROR("Unable to allocate iovec buffer");
-    }
-
-    for (unsigned i = 0; i < NUM_RING_ENTRIES; ++i)
-    {
-        fixed_buffers[i].iov_base = aligned_buffers + i * READ_BLOCK_SIZE;
-        fixed_buffers[i].iov_len  = READ_BLOCK_SIZE;
-    }
-
-    // Register buffers for IO-ring:
-    register_io_buffers(&io_ring, fixed_buffers, NUM_RING_ENTRIES);
 
     // Allocate copying status structure:
     struct CopyStatus status;
-    init_copying_status(&status, src_size, src_fd, dst_fd);
+    init_copying_status(&io_ring, &status, src_size, src_fd, dst_fd);
 
     // Perform copy operation:
     LOG("Copying '%s' of size %u", argv[1], src_size);
@@ -224,19 +256,26 @@ int main(int argc, char* argv[])
         }
 
         // Submit all unsubmitted reqs:
-        submit_and_wait(&io_ring);
+        io_uring_submit_and_wait(&io_ring, 1);
 
-        int cell_i = -1;
+        int64_t cell_i = -1;
         do
         {
-            struct io_uring_cqe ret;
-            ret = get_one_completed_io(&io_ring);
+            struct io_uring_cqe* done_req;
 
-            cell_i = ret.user_data;
+            int ret = io_uring_peek_cqe(&io_ring, &done_req);
+            if (ret == 0)
+            {
+                cell_i = done_req->user_data;
+            }
+            else
+            {
+                cell_i = -1;
+            }
 
             if (cell_i != -1 && status.block_statuses[cell_i].stage == BLOCK_IN_READ)
             {
-                if (ret.res == -1)
+                if (done_req->res == -1)
                 {
                     LOG_ERROR("Read operation failed at offset: %lu", status.block_statuses[cell_i].offset);
                 }
@@ -245,23 +284,30 @@ int main(int argc, char* argv[])
             }
             else if (cell_i != -1 && status.block_statuses[cell_i].stage == BLOCK_IN_WRITE)
             {
-                if (ret.res == -1)
+                if (done_req->res == -1)
                 {
                     LOG_ERROR("Write operation failed at offset: %lu", status.block_statuses[cell_i].offset);
                 }
 
                 finish_write_request(&status, cell_i);
             } 
+
+            io_uring_cqe_seen(&io_ring, done_req);
         }
         while (cell_i != -1);
     }
 
     // Free IO-ring:
-    free_io_ring(&io_ring);
+    io_uring_queue_exit(&io_ring);
+
+    // Perform fsync:
+    if (fsync(dst_fd) == -1)
+    {
+        LOG_ERROR("Unable to sync file");
+    }
 
     // Deallocate memory:
-    free(aligned_buffers);
-    free(fixed_buffers);
+    free_copying_status(&status);
 
     // Close files:
     if (close(src_fd) == -1)
