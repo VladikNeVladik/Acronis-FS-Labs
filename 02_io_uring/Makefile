@@ -17,8 +17,8 @@ CCFLAGS = -Werror -Wall -std=c99 -I $(abspath include) -I ${LIBURING_INCLUDE}
 
 VPATH = src
 
-HEADERS = io_uring.h logging.h
-SOURCES = cp.c logging.c
+HEADERS = io_uring.h logging.h xmalloc.h
+SOURCES = cp.c logging.c xmalloc.c
 
 OBJECTS = ${SOURCES:%.c=build/%.o}
 

@@ -1,10 +1,9 @@
-// No copyright. 2020, Vladislav Aleinik
+// No copyright. 2021, Vladislav Aleinik
 #ifndef IO_RING_COPY_LOGGING_H
 #define IO_RING_COPY_LOGGING_H
 
+#include <stdarg.h>
 #include <stdio.h>
-#include <sys/time.h>
-#include <time.h>
 
 //================
 // Logging levels 
@@ -20,20 +19,11 @@
 #define LOG_LVL_ERRORS 1U
 #define LOG_LVL_LOGS   2U
 
-//====================
-// Timestamp printout 
-//====================
+//=======================
+// Format with timestamp 
+//=======================
 
-const char* form_timestamp();
-
-#define PRINT_FORMAT_WITH_TIMESTAMP(stream, log_type, format, ...)                                          \
-do                                                                                                          \
-{                                                                                                           \
-    struct timeval __cur_time;                                                                              \
-    const char* __time_str = form_timestamp(&__cur_time);                                                   \
-                                                                                                            \
-    fprintf(stream, "[%s %s:%06ld] "format"\n", log_type, __time_str, __cur_time.tv_usec, ##__VA_ARGS__);   \
-} while (0)
+void print_format_with_timestamp(FILE* stream, const char* log_type, const char* format, ...);
 
 //=========
 // Logging
@@ -44,7 +34,7 @@ do                                                                          \
 {                                                                           \
     if ((condition))                                                        \
     {                                                                       \
-        PRINT_FORMAT_WITH_TIMESTAMP(stderr, "BUG", format, ##__VA_ARGS__);  \
+        print_format_with_timestamp(stderr, "BUG", format, ##__VA_ARGS__);  \
         exit(EXIT_FAILURE);                                                 \
     }                                                                       \
 } while (0)
@@ -56,8 +46,7 @@ do                                                                          \
     #define LOG_ERROR(format, ...)                                              \
     do                                                                          \
     {                                                                           \
-        PRINT_FORMAT_WITH_TIMESTAMP(stderr, "ERROR", format, ##__VA_ARGS__);    \
-        exit(EXIT_FAILURE);                                                     \
+        print_format_with_timestamp(stderr, "ERROR", format, ##__VA_ARGS__);    \
     } while (0)
 #endif
 
@@ -68,7 +57,7 @@ do                                                                          \
     #define LOG(format, ...)                                                \
     do                                                                      \
     {                                                                       \
-        PRINT_FORMAT_WITH_TIMESTAMP(stdout, "LOG", format, ##__VA_ARGS__);  \
+        print_format_with_timestamp(stdout, "LOG", format, ##__VA_ARGS__);  \
     } while (0)
 #endif
 
